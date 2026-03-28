@@ -5,8 +5,9 @@ RUN apt-get update && apt-get install -y python3 make g++ wget && rm -rf /var/li
 
 WORKDIR /app/backend
 
-# Install deps (postinstall runs patch-kokoro.js)
+# Install deps (postinstall runs patch-kokoro.js — needs scripts/ present first)
 COPY package*.json ./
+COPY scripts/ ./scripts/
 RUN npm install --omit=dev
 
 # Copy source

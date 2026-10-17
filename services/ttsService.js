@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const config = require('../config');
+const log = require('./logger');
 
 // Prefer system ffmpeg (Homebrew ARM-native) — the bundled binary crashes with
 // SIGABRT on the float32 WAV format that Kokoro outputs on macOS.
@@ -12,11 +13,11 @@ function resolveFfmpegPath() {
   try {
     const p = execSync('which ffmpeg', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
     if (p) {
-      console.log(`[TTS] ffmpeg: system (${p})`);
+      log.info('tts', `ffmpeg: system (${p})`);
       return p;
     }
   } catch {}
-  console.log(`[TTS] ffmpeg: bundled (${ffmpegInstaller.path})`);
+  log.info('tts', `ffmpeg: bundled (${ffmpegInstaller.path})`);
   return ffmpegInstaller.path;
 }
 ffmpeg.setFfmpegPath(resolveFfmpegPath());
@@ -33,12 +34,12 @@ async function getTTS() {
   if (_loadingPromise) return _loadingPromise;
 
   _loadingPromise = (async () => {
-    console.log('[TTS] Loading Kokoro model (first run may take a moment)...');
+    log.info('tts', 'Loading Kokoro model (first run may take a moment)...');
     const { KokoroTTS } = await import('kokoro-js');
     const tts = await KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
       dtype: 'q8',
     });
-    console.log('[TTS] Kokoro model ready.');
+    log.info('tts', 'Kokoro model ready');
     _ttsInstance = tts;
     return tts;
   })();
@@ -46,13 +47,13 @@ async function getTTS() {
   return _loadingPromise;
 }
 
-// Warm up the model on startup (non-blocking)
-getTTS().catch(err => console.error('[TTS] Model preload failed:', err.message));
 
 // ─── Text chunking ────────────────────────────────────────────────────────────
 
 function splitIntoChunks(text, chapters = [], maxChars = config.tts.chunkSize) {
-  const sentences = text.split(SENTENCE_BOUNDARY).filter(s => s.trim());
+  // Kokoro truncates past ~510 phoneme tokens, so hard-split any sentence longer than maxChars
+  const sentences = text.split(SENTENCE_BOUNDARY).filter(s => s.trim())
+    .flatMap(s => s.length > maxChars ? s.match(new RegExp(`.{1,${maxChars}}(?:\\s+|$)|\\S+`, 'g')) : [s]);
 
   const chunks = [];
   let current = '';
@@ -84,43 +85,33 @@ function splitIntoChunks(text, chapters = [], maxChars = config.tts.chunkSize) {
   return chunks;
 }
 
+const ANNOUNCE_PAUSE_SEC = 3;
+
+// Chapter heading is spoken as its own chunk, followed by a pause before the text
+function chapterChunks(title, text) {
+  const body = text.trimStart();
+  if (!title || !body.startsWith(title)) return splitIntoChunks(text);
+  const rest = splitIntoChunks(body.slice(title.length));
+  return [{ index: 0, text: title, pauseAfterSec: ANNOUNCE_PAUSE_SEC }, ...rest.map((c, i) => ({ ...c, index: i + 1 }))];
+}
+
 // ─── Conversion ───────────────────────────────────────────────────────────────
 
-async function convertChunks(chunks, voice, speed, jobChunksDir, onProgress) {
-  fs.mkdirSync(jobChunksDir, { recursive: true });
-
+// Returns the clip duration in seconds (from Kokoro samples; no ffprobe needed)
+async function synthesizeToMp3(text, { voice, speed, padSec = 0 }, mp3Path) {
+  fs.mkdirSync(path.dirname(mp3Path), { recursive: true });
   const tts = await getTTS();
-  const concurrency = config.tts.concurrency;
-  let done = 0;
-  const queue = [...chunks];
-
-  async function worker() {
-    while (queue.length) {
-      const chunk = queue.shift();
-      if (!chunk) break;
-      const mp3Path = path.join(jobChunksDir, `${String(chunk.index).padStart(4, '0')}.mp3`);
-
-      let lastErr;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          await generateChunk(tts, chunk.text, voice, speed, mp3Path);
-          lastErr = null;
-          break;
-        } catch (err) {
-          lastErr = err;
-          console.warn(`[TTS] Chunk ${chunk.index} attempt ${attempt + 1} failed: ${err.message}`);
-          console.warn(`[TTS] Chunk ${chunk.index} text preview: "${chunk.text.slice(0, 100)}"`);
-          await sleep(1000 * (attempt + 1));
-        }
-      }
-
-      if (lastErr) throw new Error(`Chunk ${chunk.index} failed: ${lastErr.message}`);
-
-      onProgress(++done, chunks.length);
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await generateChunk(tts, text, voice, speed, mp3Path, padSec);
+    } catch (err) {
+      lastErr = err;
+      log.warn('tts', `attempt ${attempt + 1} failed: ${err.message}`, { preview: text.slice(0, 100) });
+      await sleep(1000 * (attempt + 1));
     }
   }
-
-  await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length || 1) }, worker));
+  throw lastErr;
 }
 
 // Strip ALL control characters (including \n, \r, \t) — raw PDF line breaks cause
@@ -132,13 +123,13 @@ function sanitizeText(text) {
     .trim();
 }
 
-async function generateChunk(tts, text, voice, speed, mp3Path) {
+async function generateChunk(tts, text, voice, speed, mp3Path, padSec = 0) {
   const cleanText = sanitizeText(text);
 
   if (!cleanText) {
     // Write a silent placeholder so stitching doesn't break
     await createSilentMp3(mp3Path);
-    return;
+    return 1;
   }
 
   // Generate WAV via Kokoro
@@ -154,7 +145,8 @@ async function generateChunk(tts, text, voice, speed, mp3Path) {
     if (stat.size < 44) {
       throw new Error(`Kokoro produced an empty WAV (${stat.size} bytes) for: "${cleanText.slice(0, 60)}"`);
     }
-    await wavToMp3(tmpWav, mp3Path);
+    await wavToMp3(tmpWav, mp3Path, padSec);
+    return audio.audio.length / audio.sampling_rate + padSec;
   } finally {
     try { fs.unlinkSync(tmpWav); } catch {}
   }
@@ -176,9 +168,11 @@ function createSilentMp3(mp3Path) {
   });
 }
 
-function wavToMp3(wavPath, mp3Path) {
+function wavToMp3(wavPath, mp3Path, padSec = 0) {
   return new Promise((resolve, reject) => {
-    ffmpeg(wavPath)
+    const cmd = ffmpeg(wavPath);
+    if (padSec > 0) cmd.audioFilters(`apad=pad_dur=${padSec}`);
+    cmd
       .audioCodec('libmp3lame')
       .audioBitrate(64)
       // Resample to 22050 Hz mono s16 — prevents SIGABRT in bundled ffmpeg when
@@ -197,4 +191,4 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-module.exports = { splitIntoChunks, convertChunks, getTTS, sanitizeText };
+module.exports = { splitIntoChunks, chapterChunks, synthesizeToMp3, getTTS, sanitizeText };

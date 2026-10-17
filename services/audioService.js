@@ -13,22 +13,26 @@ ffmpeg.setFfmpegPath(ffmpegInstaller.path);
  * @param {number} chunkCount
  */
 async function stitchAudio(jobChunksDir, outputPath, chunkCount) {
-  // Build concat list file
-  const listPath = path.join(jobChunksDir, 'concat_list.txt');
-  const lines = [];
-
+  const paths = [];
   for (let i = 0; i < chunkCount; i++) {
     const chunkFile = path.join(jobChunksDir, `${String(i).padStart(4, '0')}.mp3`);
     if (!fs.existsSync(chunkFile)) {
       throw new Error(`Missing chunk file: ${chunkFile}`);
     }
-    lines.push(`file '${chunkFile}'`);
+    paths.push(chunkFile);
   }
+  return stitchFiles(paths, outputPath);
+}
 
-  fs.writeFileSync(listPath, lines.join('\n'));
-
-  // Ensure output directory exists
+/**
+ * Concatenate the given MP3 files, in order, into outputPath.
+ * @param {string[]} paths
+ * @param {string} outputPath
+ */
+async function stitchFiles(paths, outputPath) {
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  const listPath = `${outputPath}.concat.txt`;
+  fs.writeFileSync(listPath, paths.map(p => `file '${p}'`).join('\n'));
 
   return new Promise((resolve, reject) => {
     ffmpeg()
@@ -36,8 +40,8 @@ async function stitchAudio(jobChunksDir, outputPath, chunkCount) {
       .inputOptions(['-f', 'concat', '-safe', '0'])
       .audioCodec('copy')
       .output(outputPath)
-      .on('end', () => resolve(outputPath))
-      .on('error', (err) => reject(new Error(`ffmpeg stitch failed: ${err.message}`)))
+      .on('end', () => { fs.rmSync(listPath, { force: true }); resolve(outputPath); })
+      .on('error', (err) => { fs.rmSync(listPath, { force: true }); reject(new Error(`ffmpeg stitch failed: ${err.message}`)); })
       .run();
   });
 }
@@ -131,4 +135,4 @@ function cleanupDir(dirPath) {
   }
 }
 
-module.exports = { stitchAudio, getAudioDuration, computeChapterTimestamps, computeChapterTranscript, cleanupDir };
+module.exports = { stitchAudio, stitchFiles, getAudioDuration, computeChapterTimestamps, computeChapterTranscript, cleanupDir };

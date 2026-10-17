@@ -31,11 +31,12 @@ router.get('/:id', (req, res) => {
     chapterAudios:    job.chapter_audios || null,
     transcript:       job.transcript || null,
     error:            job.error_message || null,
+    generator:        req.app.locals.generator.state(id),
   };
   res.write(`event: status\ndata: ${JSON.stringify(current)}\n\n`);
 
-  // If already terminal, close immediately
-  if (job.status === 'complete' || job.status === 'error') {
+  // Only errors are terminal now: chapters can be (re)generated at any time
+  if (job.status === 'error') {
     res.write(`event: close\ndata: {}\n\n`);
     res.end();
     return;

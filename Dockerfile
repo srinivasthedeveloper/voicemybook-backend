@@ -16,7 +16,7 @@ COPY . .
 # Download voices to /app/voices/
 # patch-kokoro.js makes kokoro resolve: process.cwd()/../voices/ = /app/voices/
 RUN mkdir -p /app/voices && \
-    for voice in af_heart af_bella af_nicole am_fenrir am_michael am_puck bf_emma bm_george; do \
+    for voice in af_heart af_bella af_nicole am_fenrir am_michael am_puck bf_emma bm_george bm_lewis bf_isabella af_sarah af_sky am_adam bm_fable; do \
       wget -q -O /app/voices/${voice}.bin \
         "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/${voice}.bin"; \
     done

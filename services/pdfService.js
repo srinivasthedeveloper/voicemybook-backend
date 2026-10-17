@@ -2,6 +2,7 @@ const pdfParse = require('pdf-parse');
 const fs = require('fs');
 
 const CHAPTER_PATTERN = /^(chapter\s+\d+|part\s+\d+|\d+\.\s+[A-Z]|prologue|epilogue|introduction|preface|appendix)/i;
+const NUMBERED_HEADING = /^\d+\.\s+/;
 const PAGE_NUMBER_PATTERN = /^\s*\d+\s*$/;
 
 // Chapters that are front/back matter and should be skipped by default
@@ -61,6 +62,13 @@ function isTocBlock(text) {
   return dotLines.length / lines.length >= 0.4;
 }
 
+// Numbered lines count only when they look like a heading, not a numbered sentence
+function isHeadingLine(trimmed) {
+  if (!CHAPTER_PATTERN.test(trimmed)) return false;
+  if (!NUMBERED_HEADING.test(trimmed)) return true;
+  return trimmed.length <= 60 && !/[.?!]$/.test(trimmed) && !trimmed.includes('?');
+}
+
 /**
  * Detect chapter boundaries in text.
  * Returns array sorted by charOffset with isSkippable flag.
@@ -73,7 +81,7 @@ function detectChapters(text) {
   for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
     const line = lines[lineIdx];
     const trimmed = line.trim();
-    if (trimmed && CHAPTER_PATTERN.test(trimmed)) {
+    if (trimmed && isHeadingLine(trimmed)) {
       // Avoid duplicate consecutive detections (e.g. "CHAPTER 1" + "Chapter One")
       const last = chapters[chapters.length - 1];
       if (!last || charOffset - last.charOffset > 200) {
@@ -117,4 +125,4 @@ function splitChapterTexts(rawText, chapters) {
   });
 }
 
-module.exports = { extractText, splitChapterTexts };
+module.exports = { extractText, splitChapterTexts, detectChapters };

@@ -1,7 +1,11 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { execFile } = require('child_process');
 const jobService = require('../services/jobService');
+const store = require('../services/chapterStore');
+const log = require('../services/logger');
 const config = require('../config');
 
 const router = express.Router();
@@ -38,6 +42,55 @@ function serveFile(res, filePath) {
     fs.createReadStream(filePath).pipe(res);
   }
 }
+
+// GET /api/audio/:id/ch/:ch/run/:run/chunk/:n — one streamed chunk
+router.get('/:id/ch/:ch/run/:run/chunk/:n', (req, res) => {
+  if (!jobService.getJob(req.params.id)) return res.status(404).json({ error: 'Job not found' });
+  const [ch, run, n] = [req.params.ch, req.params.run, req.params.n].map(v => parseInt(v, 10));
+  if ([ch, run, n].some(isNaN)) return res.status(400).json({ error: 'Invalid chunk path' });
+  const file = path.join(config.uploadDir, 'chunks', req.params.id, `ch_${ch}`, `run_${run}`, `${String(n).padStart(4, '0')}.mp3`);
+  serveFile(res, file);
+});
+
+// GET /api/audio/:id/zip — all ready chapters, one MP3 each
+router.get('/:id/zip', (req, res, next) => {
+  const job = jobService.getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  const titles = job.chapters || [];
+  const ready = store.listChapters(job.id).filter(c => c.hasAudio)
+    .map(c => ({ ch: c.chapterIndex, file: path.join(config.uploadDir, 'audio', job.id, `ch_${c.chapterIndex}.mp3`) }))
+    .filter(r => fs.existsSync(r.file));
+  if (ready.length === 0) return res.status(404).json({ error: 'No chapters ready' });
+
+  const t0 = Date.now();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vmb-zip-'));
+  const names = ready.map(({ ch, file }) => {
+    const title = (titles[ch]?.title || `Chapter ${ch + 1}`).replace(/[\\/:*?"<>|]/g, '_');
+    const name = `${String(ch + 1).padStart(2, '0')} - ${title}.mp3`;
+    fs.symlinkSync(file, path.join(tmp, name));
+    return name;
+  });
+  const out = path.join(tmp, 'book.zip');
+
+  execFile('zip', ['-q', '-0', '-j', out, ...names], { cwd: tmp }, err => {
+    if (err) {
+      fs.rmSync(tmp, { recursive: true, force: true });
+      return next(new Error(`zip failed: ${err.message}`));
+    }
+    const book = job.pdf_filename.replace(/\.pdf$/i, '').replace(/[^\w .-]/g, '_');
+    const size = fs.statSync(out).size;
+    log.info('zip', `${job.id} ${names.length} chapters`, { bytes: size, ms: Date.now() - t0 });
+    res.writeHead(200, {
+      'Content-Type': 'application/zip',
+      'Content-Length': size,
+      'Content-Disposition': `attachment; filename="${book}.zip"`,
+    });
+    const stream = fs.createReadStream(out);
+    res.on('close', () => fs.rmSync(tmp, { recursive: true, force: true }));
+    stream.pipe(res);
+  });
+});
 
 // GET /api/audio/:id/ch/:chapterIndex — per-chapter audio
 router.get('/:id/ch/:chapterIndex', (req, res) => {

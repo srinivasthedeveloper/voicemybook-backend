@@ -7,10 +7,10 @@ const sseClients = new Map();
 
 function createJob(data) {
   const stmt = db.prepare(`
-    INSERT INTO jobs (id, status, pdf_path, pdf_filename, pdf_size_bytes, page_count, voice, speed)
-    VALUES (@id, 'pending', @pdf_path, @pdf_filename, @pdf_size_bytes, @page_count, @voice, @speed)
+    INSERT INTO jobs (id, status, pdf_path, pdf_filename, pdf_size_bytes, page_count, voice, speed, pdf_sha256)
+    VALUES (@id, 'pending', @pdf_path, @pdf_filename, @pdf_size_bytes, @page_count, @voice, @speed, @pdf_sha256)
   `);
-  stmt.run(data);
+  stmt.run({ pdf_sha256: null, ...data });
   return getJob(data.id);
 }
 
@@ -23,6 +23,11 @@ function getJob(id) {
     chapter_audios: row.chapter_audios_json ? JSON.parse(row.chapter_audios_json) : null,
     transcript: row.transcript_json ? JSON.parse(row.transcript_json) : null,
   };
+}
+
+function findJobByHash(sha256) {
+  const row = db.prepare('SELECT id FROM jobs WHERE pdf_sha256 = ?').get(sha256);
+  return row ? getJob(row.id) : null;
 }
 
 function updateJob(id, fields) {
@@ -42,6 +47,8 @@ function updateJob(id, fields) {
 }
 
 function deleteJob(id) {
+  db.prepare('DELETE FROM chunks WHERE job_id = ?').run(id);
+  db.prepare('DELETE FROM chapter_runs WHERE job_id = ?').run(id);
   db.prepare('DELETE FROM jobs WHERE id = ?').run(id);
 }
 
@@ -89,8 +96,8 @@ function emitProgress(jobId, data) {
     res.write(`event: status\ndata: ${payload}\n\n`);
   }
 
-  // Close SSE connections on terminal states
-  if (data.stage === 'complete' || data.stage === 'error') {
+  // Close SSE connections on errors only
+  if (data.stage === 'error') {
     for (const res of clients) {
       res.write(`event: close\ndata: {}\n\n`);
       res.end();
@@ -99,8 +106,18 @@ function emitProgress(jobId, data) {
   }
 }
 
+// Push to SSE clients only: no DB write, never closes the stream
+function emitEvent(jobId, data) {
+  const clients = sseClients.get(jobId);
+  if (!clients) return;
+  const payload = JSON.stringify(data);
+  for (const res of clients) res.write(`event: status\ndata: ${payload}\n\n`);
+}
+
 module.exports = {
   createJob,
+  findJobByHash,
+  emitEvent,
   getJob,
   updateJob,
   deleteJob,

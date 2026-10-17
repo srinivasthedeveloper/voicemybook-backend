@@ -4,6 +4,8 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const config = require('./config');
+const log = require('./services/logger');
+const { getGenerator } = require('./services/generator');
 
 // Initialize DB (runs migrations)
 require('./db');
@@ -20,10 +22,18 @@ app.use(cors({
   methods: ['GET', 'POST'],
 }));
 app.use(express.json());
+app.locals.generator = getGenerator();
+
+app.use('/api', (req, res, next) => {
+  const t0 = Date.now();
+  res.on('finish', () => log.info('http', `${req.method} ${req.originalUrl} ${res.statusCode}`, { ms: Date.now() - t0 }));
+  next();
+});
 
 // Routes
 app.use('/api/upload',   require('./routes/upload'));
 app.use('/api/convert',  require('./routes/convert'));
+app.use('/api/generate', require('./routes/generate'));
 app.use('/api/audio',    require('./routes/audio'));
 app.use('/api/progress', require('./routes/progress'));
 app.use('/api/job',      require('./routes/job'));
@@ -57,14 +67,20 @@ if (config.cleanupAfterHours > 0) {
         const jobChunksDir = path.join(config.uploadDir, 'chunks', job.id);
         if (fs.existsSync(jobChunksDir)) audioService.cleanupDir(jobChunksDir);
         jobService.deleteJob(job.id);
-        console.log(`[Cleanup] Deleted job ${job.id}`);
+        log.info('cleanup', `Deleted job ${job.id}`);
       } catch (err) {
-        console.error(`[Cleanup] Failed to delete job ${job.id}:`, err.message);
+        log.error('cleanup', `Failed to delete job ${job.id}`, { err });
       }
     }
   }, 60 * 60 * 1000); // run every hour
 }
 
-app.listen(config.port, () => {
-  console.log(`VoiceMyBook backend running on http://localhost:${config.port}`);
-});
+if (require.main === module) {
+  require('./services/ttsPool').getPool().start();
+  app.locals.generator.recover();
+  app.listen(config.port, () => {
+    log.info('server', `VoiceMyBook backend running on http://localhost:${config.port}`);
+  });
+}
+
+module.exports = app;

@@ -1,7 +1,8 @@
 const multer = require('multer');
+const log = require('../services/logger');
 
 function errorHandler(err, req, res, next) {
-  console.error('[Error]', err.message);
+  log.error('http', `${req.method} ${req.originalUrl} failed: ${err.message}`, { err });
 
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {

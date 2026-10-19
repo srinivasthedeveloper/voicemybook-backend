@@ -238,3 +238,17 @@ test('preview stream sends each part as it finishes, without ID3 or Info headers
   assert.strictEqual((await fetch(`${base}/voices/preview/stream/unknown-id`)).status, 404);
   app.locals.synth = saved;
 });
+
+test('book summaries: status per book, only for the ids asked', async () => {
+  const done = seedJob(), running = seedJob(), stopped = seedJob(), fresh = seedJob();
+  store.setChapter(done, 0, { state: 'ready', hasAudio: true });
+  store.setChapter(running, 0, { state: 'ready', hasAudio: true });
+  store.setChapter(running, 1, { state: 'generating' });
+  store.setChapter(stopped, 0, { state: 'paused' });
+  const r = await fetch(`${base}/job/summary?ids=${[done, running, stopped, fresh, 'gone'].join(',')}`);
+  assert.strictEqual(r.status, 200);
+  const books = await r.json();
+  assert.deepStrictEqual(books.map(b => [b.id, b.status]), [[done, 'done'], [running, 'generating'], [stopped, 'stopped'], [fresh, 'not_started']]);
+  assert.deepStrictEqual(books[1], { id: running, filename: 'My Book.pdf', createdAt: books[1].createdAt, totalChapters: 2, readyChapters: 1, status: 'generating' });
+  assert.deepStrictEqual(await (await fetch(`${base}/job/summary`)).json(), []);
+});

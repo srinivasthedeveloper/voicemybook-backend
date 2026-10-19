@@ -9,3 +9,6 @@ uploads/
 .DS_Store
 **/*.log
 
+
+# Voice clips for Chatterbox: local only (Hugging Face rejects binaries; audiobook audio is not ours to publish)
+voices-ref/*.wav

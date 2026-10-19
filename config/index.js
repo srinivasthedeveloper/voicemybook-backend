@@ -20,7 +20,7 @@ module.exports = {
     defaultVoice: process.env.TTS_VOICE || 'af_heart',
   },
 
-  cleanupAfterHours: parseInt(process.env.CLEANUP_AFTER_HOURS) || 24,
+  cleanupAfterHours: parseInt(process.env.CLEANUP_AFTER_HOURS) || 720, // 30 days; negative disables
 
   // Kokoro neural voices (grade A/B only)
   voices: [

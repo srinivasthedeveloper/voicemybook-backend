@@ -8,7 +8,7 @@ function setupTmpEnv() {
   process.env.DB_PATH = path.join(dir, 'test.db');
   process.env.UPLOAD_DIR = path.join(dir, 'uploads');
   process.env.NODE_ENV = 'test';
-  process.env.CLEANUP_AFTER_HOURS = '-1'; // '0' falls back to 24 in config
+  process.env.CLEANUP_AFTER_HOURS = '-1'; // '0' falls back to the 30-day default
   process.env.LOG_LEVEL = process.env.LOG_LEVEL || 'error';
   return dir;
 }

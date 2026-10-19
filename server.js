@@ -26,6 +26,7 @@ app.locals.generator = getGenerator();
 
 app.use('/api', (req, res, next) => {
   const t0 = Date.now();
+  if (req.path.startsWith('/voices/preview/progress/')) return next(); // polled every second
   res.on('finish', () => log.info('http', `${req.method} ${req.originalUrl} ${res.statusCode}`, { ms: Date.now() - t0 }));
   next();
 });

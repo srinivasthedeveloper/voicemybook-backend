@@ -2,20 +2,27 @@ const fs = require('fs');
 const path = require('path');
 const log = require('./logger');
 const { chapterChunks } = require('./ttsService');
+const { engineOf } = require('./refVoices');
 
 const pad = n => String(n).padStart(4, '0');
 
 function createGenerator(deps) {
-  const { synthesize, stitch, getChapters, emit, store, jobs, uploadDir, parallel = 1 } = deps;
-  const queue = [];           // [{ jobId, chapterIndex }]
+  const { synthesize, stitch, getChapters, emit, store, jobs, uploadDir } = deps;
+  const slots = { kokoro: deps.parallel ?? 1, turbo: 1, chatterbox: 1, ...deps.slots };
+  const engineStatus = deps.engineStatus || (() => ({}));
+  const modelCached = deps.modelCached || (() => true);
+  const queue = [];           // [{ jobId, chapterIndex, engine }]
   const actives = new Map();  // key -> { jobId, chapterIndex, request: null | 'pause' | 'stop', done }
   const totals = new Map();   // key -> chunk count of the chapter text
   const etas = new Map();     // key -> estimated seconds left
-  let msPerChar = 0;          // moving average of synthesis time per character
+  const msPerChar = {};       // engine -> moving average of synthesis time per character
+  const DOWNLOAD = { turbo: '~4 GB', chatterbox: '~3.2 GB' };
 
   const runDir = (jobId, ch, runId) => path.join(uploadDir, 'chunks', jobId, `ch_${ch}`, `run_${runId}`);
   const chunkUrl = (jobId, ch, runId, i) => `/api/audio/${jobId}/ch/${ch}/run/${runId}/chunk/${i}`;
   const keyOf = (jobId, ch) => `${jobId}:${ch}`;
+  const engineOfJob = jobId => engineOf(jobs.getJob(jobId)?.voice);
+  const enqueue = (jobId, ch) => queue.push({ jobId, chapterIndex: ch, engine: engineOfJob(jobId) });
   const activeOf = (jobId, ch) => [...actives.values()].filter(a => a.jobId === jobId && (ch == null || a.chapterIndex === ch));
 
   function setState(jobId, ch, patch, extra = {}) {
@@ -26,9 +33,10 @@ function createGenerator(deps) {
   }
 
   function emitQueue(extraJobIds = []) {
-    const payload = queue.map(q => ({ jobId: q.jobId, chapterIndex: q.chapterIndex }));
+    const payload = queue.map(q => ({ jobId: q.jobId, chapterIndex: q.chapterIndex, engine: q.engine }));
     for (const id of new Set([...extraJobIds, ...queue.map(q => q.jobId)])) {
-      emit(id, { stage: 'generator_state', queue: payload, parallel, msPerChar });
+      const engine = engineOfJob(id);
+      emit(id, { stage: 'generator_state', queue: payload, parallel: slots[engine], msPerChar: msPerChar[engine] ?? 0 });
     }
   }
 
@@ -45,10 +53,12 @@ function createGenerator(deps) {
     return removed;
   }
 
-  // Fills free slots (up to `parallel` chapters at once) from the FIFO queue
+  // Fills each engine's free slots from the FIFO queue; a busy engine never holds up another
   function kick() {
-    while (actives.size < parallel && queue.length) {
-      const item = queue.shift();
+    const busy = engine => [...actives.values()].filter(a => a.engine === engine).length;
+    for (let i = 0; i < queue.length;) {
+      if (busy(queue[i].engine) >= slots[queue[i].engine]) { i++; continue; }
+      const item = queue.splice(i, 1)[0];
       const key = keyOf(item.jobId, item.chapterIndex);
       const current = { ...item, request: null };
       actives.set(key, current);
@@ -73,7 +83,8 @@ function createGenerator(deps) {
   async function runChapter(item) {
     const { jobId, chapterIndex: ch } = item;
     const chapter = (await getChapters(jobId))[ch] || {};
-    const chunks = chapterChunks(chapter.title, chapter.text || '');
+    const engine = item.engine;
+    const chunks = chapterChunks(chapter.title, chapter.text || '', engine);
     if (chunks.length === 0) {
       log.warn('gen', `${jobId} ch${ch} has no text, skipping`);
       const c = store.getChapter(jobId, ch);
@@ -82,18 +93,34 @@ function createGenerator(deps) {
     const key = keyOf(jobId, ch);
     const charsFrom = i => chunks.slice(i).reduce((n, c) => n + c.text.length, 0);
     totals.set(key, chunks.length);
-    const { runId } = setState(jobId, ch, { state: 'generating' }, { totalChunks: chunks.length });
+    // A run's chunks must all come from one engine: left-over chunks from another engine start a new run
+    const prev = store.getChapter(jobId, ch);
+    const leftover = store.listChunks(jobId, ch, prev.runId);
+    const stale = leftover.length > 0 && engineOf(leftover[0].voice) !== engine;
+    if (stale) discardRun(jobId, ch, prev.runId);
+    const { runId } = setState(jobId, ch, stale ? { state: 'generating', runId: prev.runId + 1 } : { state: 'generating' }, { totalChunks: chunks.length });
     const dir = runDir(jobId, ch, runId);
+    if (engine !== 'kokoro' && engineStatus()[engine] !== 'ready') {
+      const note = `Loading the expressive voice…${modelCached(engine) ? '' : ` (first use downloads ${DOWNLOAD[engine]})`}`;
+      setState(jobId, ch, { state: 'generating' }, { totalChunks: chunks.length, note });
+    }
 
     for (let i = store.listChunks(jobId, ch, runId).length; i < chunks.length; i++) {
       if (item.request) return applyRequest(item, runId);
       const { voice, speed } = jobs.getJob(jobId);
+      if (engineOf(voice) !== engine) {
+        // The book switched engine mid-run: start this chapter over on the new engine
+        discardRun(jobId, ch, runId);
+        setState(jobId, ch, { state: 'queued', runId: runId + 1 });
+        enqueue(jobId, ch);
+        return;
+      }
       const filePath = path.join(dir, `${pad(i)}.mp3`);
       const t0 = Date.now();
       const durationSec = await synthesize(chunks[i].text, { voice, speed, padSec: chunks[i].pauseAfterSec }, filePath);
       const sample = (Date.now() - t0) / Math.max(1, chunks[i].text.length);
-      msPerChar = msPerChar ? msPerChar * 0.7 + sample * 0.3 : sample;
-      const etaSec = Math.round((charsFrom(i + 1) * msPerChar) / 1000);
+      msPerChar[engine] = msPerChar[engine] ? msPerChar[engine] * 0.7 + sample * 0.3 : sample;
+      const etaSec = Math.round((charsFrom(i + 1) * msPerChar[engine]) / 1000);
       etas.set(key, etaSec);
       store.addChunk({ jobId, chapterIndex: ch, runId, chunkIndex: i, text: chunks[i].text, voice, speed, durationSec, filePath });
       emit(jobId, { stage: 'chunk_ready', chapterIndex: ch, runId, chunkIndex: i, totalChunks: chunks.length, etaSec, url: chunkUrl(jobId, ch, runId, i), text: chunks[i].text, durationSec, voice, speed });
@@ -148,7 +175,7 @@ function createGenerator(deps) {
       const c = store.getChapter(jobId, ch);
       if (c.state === 'queued' || c.state === 'generating') continue;
       setState(jobId, ch, c.state === 'paused' ? { state: 'queued' } : { state: 'queued', runId: c.runId + 1 });
-      queue.push({ jobId, chapterIndex: ch });
+      enqueue(jobId, ch);
     }
     emitQueue([jobId]);
     kick();
@@ -174,7 +201,7 @@ function createGenerator(deps) {
     const order = first != null && paused.includes(first) ? [first, ...paused.filter(i => i !== first)] : paused;
     for (const ch of order) {
       setState(jobId, ch, { state: 'queued' });
-      queue.push({ jobId, chapterIndex: ch });
+      enqueue(jobId, ch);
     }
     emitQueue([jobId]);
     kick();
@@ -235,9 +262,9 @@ function createGenerator(deps) {
     return {
       voice: job ? job.voice : null,
       speed: job ? job.speed : null,
-      queue: queue.map(q => ({ jobId: q.jobId, chapterIndex: q.chapterIndex })),
-      parallel,
-      msPerChar,
+      queue: queue.map(q => ({ jobId: q.jobId, chapterIndex: q.chapterIndex, engine: q.engine })),
+      parallel: slots[engineOfJob(jobId)],
+      msPerChar: msPerChar[engineOfJob(jobId)] ?? 0,
       chapters: store.listChapters(jobId).map(c => ({
         chapterIndex: c.chapterIndex,
         state: c.state,
@@ -277,12 +304,15 @@ function getGenerator() {
   const store = require('./chapterStore');
   const jobService = require('./jobService');
   const pdfService = require('./pdfService');
-  const { getPool } = require('./ttsPool');
+  const { getSynth } = require('./synth');
+  const { modelCached } = require('./refVoices');
   const audioService = require('./audioService');
   const textCache = new Map();
   _generator = createGenerator({
-    synthesize: (text, opts, mp3Path) => getPool().synthesize(text, opts, mp3Path),
-    parallel: config.tts.workers,
+    synthesize: (text, opts, mp3Path) => getSynth().synthesize(text, opts, mp3Path),
+    engineStatus: () => getSynth().engineStatus(),
+    modelCached,
+    slots: { kokoro: config.tts.workers, turbo: config.tts.turboWorkers, chatterbox: config.tts.cbWorkers },
     stitch: audioService.stitchFiles,
     getChapters: jobId => {
       if (!textCache.has(jobId)) {

@@ -2,16 +2,15 @@ const express = require('express');
 const jobService = require('../services/jobService');
 const log = require('../services/logger');
 const config = require('../config');
+const { isValidVoice, engineOf } = require('../services/refVoices');
 
 const router = express.Router();
-
-const VALID_VOICES = new Set(config.voices.map(v => v.id));
 
 // Validates voice/speed; missing fields fall back to the job's current values
 function validateSettings(body, job = {}) {
   const voice = body.voice ?? job.voice ?? config.tts.defaultVoice;
   const speed = body.speed ?? job.speed ?? 1.0;
-  if (!VALID_VOICES.has(voice)) return { error: `Unknown voice: ${voice}` };
+  if (!isValidVoice(voice)) return { error: `Unknown voice: ${voice}` };
   if (typeof speed !== 'number' || !(speed >= 0.5 && speed <= 2.0)) return { error: 'speed must be a number between 0.5 and 2.0' };
   return { voice, speed };
 }
@@ -85,6 +84,9 @@ router.post('/:jobId/settings', loadJob, async (req, res, next) => {
     if (chapterIndex != null && !validChapter(req.job, chapterIndex)) return res.status(400).json({ error: 'Invalid chapterIndex' });
     const s = validateSettings(req.body, req.job);
     if (s.error) return res.status(400).json({ error: s.error });
+    if (mode === 'resume' && engineOf(s.voice) !== engineOf(req.job.voice)) {
+      return res.status(400).json({ error: 'Switching engines restarts the chapter; use start over' });
+    }
     await req.app.locals.generator.applySettings(req.job.id, s, mode, chapterIndex);
     ok(res);
   } catch (err) { next(err); }

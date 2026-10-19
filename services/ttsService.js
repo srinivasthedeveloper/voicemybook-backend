@@ -87,11 +87,43 @@ function splitIntoChunks(text, chapters = [], maxChars = config.tts.chunkSize) {
 
 const ANNOUNCE_PAUSE_SEC = 3;
 
+const TURBO_GAP_SEC = 0.3;
+
+// Turbo drifts on long input: one sentence per call (<= maxChars); pieces under minWords ride with the next one
+function turboSentences(text, maxChars = 200, minWords = 4) {
+  const parts = text.split(/(?<=[.!?]["'”’]?)\s+(?=["'“‘A-Z])/).map(p => p.trim()).filter(Boolean);
+  const merged = [];
+  for (const p of parts) {
+    const prev = merged[merged.length - 1];
+    if (prev !== undefined && prev.split(/\s+/).length < minWords) merged[merged.length - 1] = `${prev} ${p}`;
+    else merged.push(p);
+  }
+  // A lone last fragment (e.g. a closing "No!") joins the one before it; '"DURSLEY!" he boomed.' stays, as in the rated spike
+  if (merged.length > 1 && merged[merged.length - 1].split(/\s+/).length < minWords - 1) {
+    merged.splice(-2, 2, `${merged[merged.length - 2]} ${merged[merged.length - 1]}`);
+  }
+  const out = [];
+  for (let p of merged) {
+    while (p.length > maxChars) {
+      let cut = p.lastIndexOf(',', maxChars - 1);
+      if (cut <= 40) cut = p.lastIndexOf(' ', maxChars - 1);
+      if (cut < 1) cut = maxChars - 1; // no space at all: hard cut
+      out.push(p.slice(0, cut + 1).trim());
+      p = p.slice(cut + 1).trim();
+    }
+    out.push(p);
+  }
+  return out;
+}
+
 // Chapter heading is spoken as its own chunk, followed by a pause before the text
-function chapterChunks(title, text) {
+function chapterChunks(title, text, engine = 'kokoro') {
+  const split = engine === 'turbo'
+    ? t => turboSentences(t).map((p, i) => ({ index: i, text: p, pauseAfterSec: TURBO_GAP_SEC }))
+    : t => splitIntoChunks(t);
   const body = text.trimStart();
-  if (!title || !body.startsWith(title)) return splitIntoChunks(text);
-  const rest = splitIntoChunks(body.slice(title.length));
+  if (!title || !body.startsWith(title)) return split(text);
+  const rest = split(body.slice(title.length));
   return [{ index: 0, text: title, pauseAfterSec: ANNOUNCE_PAUSE_SEC }, ...rest.map((c, i) => ({ ...c, index: i + 1 }))];
 }
 
@@ -191,4 +223,4 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-module.exports = { splitIntoChunks, chapterChunks, synthesizeToMp3, getTTS, sanitizeText };
+module.exports = { splitIntoChunks, chapterChunks, turboSentences, synthesizeToMp3, getTTS, sanitizeText };

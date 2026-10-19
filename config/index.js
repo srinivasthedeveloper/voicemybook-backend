@@ -6,12 +6,17 @@ module.exports = {
   nodeEnv: process.env.NODE_ENV || 'development',
 
   uploadDir: path.resolve(process.env.UPLOAD_DIR || './uploads'),
+  voicesRefDir: path.resolve(process.env.VOICES_REF_DIR || './voices-ref'),
+  chatterboxPython: process.env.CHATTERBOX_PYTHON || path.resolve(__dirname, '..', 'tts-python', '.venv', 'bin', 'python'),
   maxFileSizeMB: parseInt(process.env.MAX_FILE_SIZE_MB) || 50,
 
   tts: {
     concurrency: parseInt(process.env.TTS_CONCURRENCY) || 3,
     chunkSize: parseInt(process.env.TTS_CHUNK_SIZE) || 400,
     workers: parseInt(process.env.TTS_WORKERS) || 2, // Kokoro processes = chapters generated in parallel
+    turboWorkers: parseInt(process.env.TURBO_WORKERS) || 1,
+    cbWorkers: parseInt(process.env.CB_WORKERS) || 1,
+    chatterboxIdleMin: parseInt(process.env.CHATTERBOX_IDLE_MIN) || 10,
     defaultVoice: process.env.TTS_VOICE || 'af_heart',
   },
 

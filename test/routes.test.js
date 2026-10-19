@@ -5,6 +5,12 @@ const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const dir = require('./helpers').setupTmpEnv();
+// A reference clip and a stand-in Python so Chatterbox voices are listed
+process.env.VOICES_REF_DIR = path.join(dir, 'voices-ref');
+process.env.CHATTERBOX_PYTHON = path.join(dir, 'fake-python');
+fs.mkdirSync(process.env.VOICES_REF_DIR, { recursive: true });
+fs.writeFileSync(path.join(process.env.VOICES_REF_DIR, 'epilogue.wav'), 'x');
+fs.writeFileSync(process.env.CHATTERBOX_PYTHON, '');
 const app = require('../server');
 const store = require('../services/chapterStore');
 const jobService = require('../services/jobService');
@@ -153,4 +159,82 @@ test('stop-all route clears the queue', async () => {
   assert.strictEqual((await post('/generate/stop-all', {})).status, 202);
   const s = await (await fetch(`${base}/generate/${id}`)).json();
   assert.deepStrictEqual(s.queue, []);
+});
+
+const synthCalls = [];
+const fakeSynthPool = name => ({ synthesize: async (t, o, p) => { synthCalls.push(name); fs.writeFileSync(p, 'x'); return 1; }, status: () => 'ready' });
+app.locals.synth = require('../services/synth').createSynth({ kokoro: fakeSynthPool('kokoro'), turbo: fakeSynthPool('turbo'), chatterbox: fakeSynthPool('chatterbox') });
+
+test('voices list includes engine status', async () => {
+  const body = await (await fetch(`${base}/voices`)).json();
+  assert.deepStrictEqual(Object.keys(body.engineStatus).sort(), ['chatterbox', 'turbo']);
+  assert.ok(body.voices.every(v => v.engine));
+  assert.ok(body.voices.some(v => v.id === 'turbo:epilogue') && body.voices.some(v => v.id === 'cb:epilogue'));
+});
+
+test('resume across engines is rejected', async () => {
+  const id = seedJob();
+  const r1 = await post(`/generate/${id}/settings`, { voice: 'turbo:epilogue', speed: 1, mode: 'resume' });
+  assert.strictEqual(r1.status, 400);
+  assert.match((await r1.json()).error, /Switching engines restarts the chapter/);
+  assert.strictEqual((await post(`/generate/${id}/settings`, { voice: 'turbo:epilogue', speed: 1, mode: 'restart-chapter' })).status, 202);
+  assert.strictEqual(jobService.getJob(id).voice, 'turbo:epilogue');
+});
+
+test('preview routes chatterbox voice to its pool', async () => {
+  synthCalls.length = 0;
+  const r = await post('/voices/preview', { voice: 'cb:epilogue', speed: 1, text: 'Hello there.' });
+  assert.strictEqual(r.status, 200);
+  assert.ok(synthCalls.includes('chatterbox') && !synthCalls.includes('kokoro'));
+  assert.strictEqual((await post('/voices/preview', { voice: 'turbo:nope', speed: 1, text: 'x' })).status, 400);
+});
+
+test('cancelled preview stops generating the remaining parts', async () => {
+  const saved = app.locals.synth;
+  let calls = 0, lastSignal;
+  app.locals.synth = { synthesize: async (t, o, p, signal) => { calls++; lastSignal = signal; await new Promise(r => setTimeout(r, 30)); fs.writeFileSync(p, 'x'); return 1; }, engineStatus: () => ({}) };
+  const ac = new AbortController();
+  const req = fetch(`${base}/voices/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ voice: 'turbo:epilogue', speed: 1, text: 'This sentence is part of the test. '.repeat(20) }), signal: ac.signal }).catch(() => {});
+  setTimeout(() => ac.abort(), 80);
+  await req;
+  await new Promise(r => setTimeout(r, 400));
+  app.locals.synth = saved;
+  assert.ok(calls < 10, `expected generation to stop early, got ${calls} of 20 parts`);
+  assert.strictEqual(lastSignal?.aborted, true, 'the running part is told to stop');
+});
+
+test('preview progress reports parts done and an ETA while generating', async () => {
+  const saved = app.locals.synth;
+  app.locals.synth = { synthesize: async (t, o, p) => { await new Promise(r => setTimeout(r, 40)); fs.writeFileSync(p, 'x'); return 1; }, engineStatus: () => ({}) };
+  const id = 'progress-test-1';
+  const done = post('/voices/preview', { id, voice: 'turbo:epilogue', speed: 1, text: 'This sentence is part of the test. '.repeat(10) });
+  await new Promise(r => setTimeout(r, 150));
+  const mid = await (await fetch(`${base}/voices/preview/progress/${id}`)).json();
+  assert.strictEqual(mid.total, 10);
+  assert.ok(mid.done >= 1 && mid.done < 10, `done=${mid.done}`);
+  assert.ok(mid.etaSec >= 0);
+  await done; // stitching the fake 'x' files fails; only the cleanup matters here
+  assert.strictEqual((await fetch(`${base}/voices/preview/progress/${id}`)).status, 404);
+  app.locals.synth = saved;
+});
+
+test('preview stream sends each part as it finishes, without ID3 or Info headers', async () => {
+  const saved = app.locals.synth;
+  const id3 = Buffer.concat([Buffer.from('ID3'), Buffer.from([4, 0, 0, 0, 0, 0, 2]), Buffer.from('xx')]);
+  // LAME "Info" frame (MPEG-2 layer III, 64 kbps, 22050 Hz = 208 bytes): it states one part's length, so the browser would stop there
+  const info = Buffer.alloc(208);
+  info.set([0xff, 0xf3, 0x80, 0xc4]);
+  info.write('Info', 13);
+  app.locals.synth = { synthesize: async (t, o, p) => { await new Promise(r => setTimeout(r, 30)); fs.writeFileSync(p, Buffer.concat([id3, info, Buffer.from(`[${t}]`)])); return 1; }, engineStatus: () => ({}) };
+  const id = 'stream-test-1';
+  const text = 'The first sentence is here now. The second sentence is here now. The third sentence is here now.';
+  const stream = fetch(`${base}/voices/preview/stream/${id}`); // may arrive before the POST registers the id
+  await new Promise(r => setTimeout(r, 50));
+  const done = post('/voices/preview', { id, voice: 'turbo:epilogue', speed: 1, text });
+  const r = await stream;
+  assert.strictEqual(r.headers.get('content-type'), 'audio/mpeg');
+  assert.strictEqual(await r.text(), '[The first sentence is here now.][The second sentence is here now.][The third sentence is here now.]');
+  await done;
+  assert.strictEqual((await fetch(`${base}/voices/preview/stream/unknown-id`)).status, 404);
+  app.locals.synth = saved;
 });

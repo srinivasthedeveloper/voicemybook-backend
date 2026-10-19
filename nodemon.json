@@ -1,3 +1,11 @@
 {
-  "ignore": ["test/**", "uploads/**", "*.db", "*.db-*", "node_modules/**"]
+  "ignore": [
+    "test/**",
+    "uploads/**",
+    "*.db",
+    "*.db-*",
+    "node_modules/**",
+    "voices-ref/**",
+    "tts-python/**"
+  ]
 }

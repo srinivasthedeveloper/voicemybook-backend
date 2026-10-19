@@ -349,3 +349,85 @@ test('chunk events carry a time-left estimate that reaches zero', async () => {
   assert.ok(etas.every((e, i) => i === 0 || e <= etas[i - 1]), 'estimate never goes up');
   assert.ok(t.gen.state(t.jobId).msPerChar > 0);
 });
+
+// One generator shared by a Turbo book and a Kokoro book; the fake synth can block per voice prefix
+function setupEngines({ slots, engineStatus, modelCached, msPerCharFor = {}, repeat = 4 } = {}) {
+  const books = { turbo: `eng${++seq}`, kokoro: `eng${++seq}` };
+  jobService.createJob({ id: books.turbo, pdf_path: '/p.pdf', pdf_filename: 'p.pdf', pdf_size_bytes: 1, page_count: 1, voice: 'turbo:x', speed: 1 });
+  jobService.createJob({ id: books.kokoro, pdf_path: '/p.pdf', pdf_filename: 'p.pdf', pdf_size_bytes: 1, page_count: 1, voice: 'af_heart', speed: 1 });
+  const events = [], calls = [];
+  const block = { turbo: null };
+  const gen = createGenerator({
+    synthesize: async (text, opts, mp3Path) => {
+      calls.push({ text, ...opts });
+      const engine = opts.voice.startsWith('turbo:') ? 'turbo' : 'kokoro';
+      if (engine === 'turbo' && block.turbo) await block.turbo;
+      if (msPerCharFor[engine]) await new Promise(r => setTimeout(r, msPerCharFor[engine] * text.length));
+      fs.mkdirSync(path.dirname(mp3Path), { recursive: true });
+      fs.writeFileSync(mp3Path, 'x');
+      return 1;
+    },
+    stitch: async (paths, out) => fs.writeFileSync(out, 'x'),
+    getChapters: async () => [0, 1].map(i => ({ title: `Chapter ${i + 1}`, text: `Chapter ${i + 1}\n${sentence.repeat(repeat)}` })),
+    emit: (id, e) => events.push({ id, ...e }),
+    store, jobs: jobService, uploadDir, slots, engineStatus, modelCached,
+  });
+  const st = (job, ch) => store.getChapter(job, ch).state;
+  return { books, gen, events, calls, block, st };
+}
+
+test('engines do not block each other', async () => {
+  const t = setupEngines({ slots: { kokoro: 1, turbo: 1, chatterbox: 1 } });
+  let release;
+  t.block.turbo = new Promise(r => { release = r; });
+  await t.gen.start(t.books.turbo, [0, 1]);
+  await t.gen.start(t.books.kokoro, [0]);
+  await waitFor(() => t.st(t.books.kokoro, 0) === 'ready');
+  assert.strictEqual(t.st(t.books.turbo, 0), 'generating');
+  assert.strictEqual(t.st(t.books.turbo, 1), 'queued');
+  assert.ok(t.gen.state(t.books.turbo).queue.every(q => q.engine));
+  release();
+  await waitFor(() => t.st(t.books.turbo, 1) === 'ready');
+});
+
+test('turbo chapter uses sentence chunks with 0.3 pad', async () => {
+  const t = setupEngines();
+  await t.gen.start(t.books.turbo, [0]);
+  await waitFor(() => t.st(t.books.turbo, 0) === 'ready');
+  const mine = t.calls.filter(c => c.voice === 'turbo:x');
+  assert.strictEqual(mine[0].padSec, 3);
+  assert.ok(mine.length > 2 && mine.slice(1).every(c => c.padSec === 0.3 && c.text.length <= 200));
+});
+
+test('per-engine estimates', async () => {
+  const t = setupEngines({ msPerCharFor: { turbo: 0.3, kokoro: 0.02 } });
+  await t.gen.start(t.books.turbo, [0]);
+  await t.gen.start(t.books.kokoro, [0]);
+  await waitFor(() => t.st(t.books.turbo, 0) === 'ready' && t.st(t.books.kokoro, 0) === 'ready', 8000);
+  assert.ok(t.gen.state(t.books.turbo).msPerChar > t.gen.state(t.books.kokoro).msPerChar);
+});
+
+test('preparing note while engine starts', async () => {
+  const t = setupEngines({ engineStatus: () => ({ turbo: 'starting', chatterbox: 'stopped' }), modelCached: () => false });
+  await t.gen.start(t.books.turbo, [0]);
+  await waitFor(() => t.st(t.books.turbo, 0) === 'ready');
+  const notes = t.events.filter(e => e.id === t.books.turbo && e.stage === 'chapter_state' && e.note).map(e => e.note);
+  assert.deepStrictEqual(notes, ['Loading the expressive voice… (first use downloads ~4 GB)']);
+});
+
+test('switching engine never mixes engines inside one chapter run', async () => {
+  const t = setupEngines({ slots: { kokoro: 2, turbo: 1, chatterbox: 1 }, msPerCharFor: { kokoro: 1 }, repeat: 20 });
+  const job = t.books.kokoro;
+  await t.gen.start(job, [0, 1]);
+  await waitFor(() => t.calls.filter(c => c.voice === 'af_heart').length >= 3);
+  await t.gen.pauseJob(job);
+  await waitFor(() => t.st(job, 0) === 'paused' && t.st(job, 1) === 'paused');
+  await t.gen.applySettings(job, { voice: 'turbo:x', speed: 1 }, 'restart-chapter', 0);
+  await waitFor(() => t.st(job, 0) === 'ready' && t.st(job, 1) === 'ready', 15000);
+  for (const ch of [0, 1]) {
+    const chunks = store.listChunks(job, ch, store.getChapter(job, ch).runId);
+    assert.ok(chunks.every(c => c.voice === 'turbo:x'), `ch${ch} mixes engines`);
+    const book = `Chapter ${ch + 1}\n${sentence.repeat(20)}`;
+    assert.strictEqual(chunks.map(c => c.text).join(' ').replace(/\s+/g, ' '), book.replace(/\s+/g, ' ').trim(), `ch${ch} text differs from the book`);
+  }
+});

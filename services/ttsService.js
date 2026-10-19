@@ -177,7 +177,7 @@ async function generateChunk(tts, text, voice, speed, mp3Path, padSec = 0) {
     if (stat.size < 44) {
       throw new Error(`Kokoro produced an empty WAV (${stat.size} bytes) for: "${cleanText.slice(0, 60)}"`);
     }
-    await wavToMp3(tmpWav, mp3Path, padSec);
+    await wavToMp3(tmpWav, mp3Path, padSec, audio.sampling_rate);
     return audio.audio.length / audio.sampling_rate + padSec;
   } finally {
     try { fs.unlinkSync(tmpWav); } catch {}
@@ -200,10 +200,11 @@ function createSilentMp3(mp3Path) {
   });
 }
 
-function wavToMp3(wavPath, mp3Path, padSec = 0) {
+function wavToMp3(wavPath, mp3Path, padSec = 0, sampleRate = 24000) {
   return new Promise((resolve, reject) => {
     const cmd = ffmpeg(wavPath);
-    if (padSec > 0) cmd.audioFilters(`apad=pad_dur=${padSec}`);
+    // pad_len (samples), not pad_dur: the deployed Linux ffmpeg (2018 build) predates pad_dur
+    if (padSec > 0) cmd.audioFilters(`apad=pad_len=${Math.round(padSec * sampleRate)}`);
     cmd
       .audioCodec('libmp3lame')
       .audioBitrate(64)
@@ -223,4 +224,4 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-module.exports = { splitIntoChunks, chapterChunks, turboSentences, synthesizeToMp3, getTTS, sanitizeText };
+module.exports = { splitIntoChunks, chapterChunks, turboSentences, synthesizeToMp3, getTTS, sanitizeText, wavToMp3 };

@@ -76,3 +76,18 @@ test('a long piece without spaces is hard-cut, not looped forever', () => {
 test('a short last piece joins the previous one', () => {
   assert.deepStrictEqual(turboSentences('He walked into the old room slowly. No!'), ['He walked into the old room slowly. No!']);
 });
+
+test('wavToMp3 pads silence by sample count (old ffmpeg builds lack apad pad_dur)', async () => {
+  const { execFileSync } = require('child_process');
+  const fs = require('fs'), os = require('os'), path = require('path');
+  const ff = require('@ffmpeg-installer/ffmpeg').path;
+  const { wavToMp3 } = require('../services/ttsService');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vmb-pad-'));
+  const wav = path.join(dir, 'in.wav'), mp3 = path.join(dir, 'out.mp3');
+  execFileSync(ff, ['-y', '-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=d=1:r=24000', wav]);
+  await wavToMp3(wav, mp3, 0.5, 24000);
+  const info = require('child_process').spawnSync(ff, ['-i', mp3, '-f', 'null', '-']).stderr.toString();
+  const [, h, m, s] = info.match(/time=(\d+):(\d+):([\d.]+)/g).pop().match(/(\d+):(\d+):([\d.]+)/);
+  assert.ok(Math.abs(+h * 3600 + +m * 60 + +s - 1.5) < 0.1, info.slice(-200));
+  fs.rmSync(dir, { recursive: true, force: true });
+});

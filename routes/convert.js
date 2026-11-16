@@ -20,7 +20,7 @@ router.post('/', async (req, res, next) => {
     const total = (job.chapters || []).length;
     const chapterIndices = Array.isArray(selectedChapterIndices) && selectedChapterIndices.length
       ? selectedChapterIndices.filter(i => Number.isInteger(i) && i >= 0 && i < total)
-      : (job.chapters || []).map((c, i) => i).filter(i => !job.chapters[i].isSkippable);
+      : (job.chapters || []).map((c, i) => i).filter(i => !job.chapters[i].isSkippable && !job.chapters[i].isPageRange);
 
     jobService.updateJob(jobId, { voice: s.voice, speed: s.speed });
     await req.app.locals.generator.start(jobId, chapterIndices);

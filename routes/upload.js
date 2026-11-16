@@ -8,6 +8,10 @@ const jobService = require('../services/jobService');
 const { analyzeJob } = require('../queues/conversionQueue');
 const log = require('../services/logger');
 const config = require('../config');
+const path = require('path');
+const store = require('../services/chapterStore');
+const db = require('../db');
+const audioService = require('../services/audioService');
 
 const router = express.Router();
 
@@ -43,6 +47,64 @@ router.get('/lookup', (req, res) => {
   if (!job) return res.status(404).json({ error: 'Not found' });
   reanalyzeIfBroken(job);
   res.json(describe(job, { cached: true }));
+});
+
+// POST /api/upload/:jobId/replace — same book entry: drop its audio and detect chapters again
+router.post('/:jobId/replace', async (req, res, next) => {
+  try {
+    const job = jobService.getJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (store.listChapters(job.id).some(c => c.state === 'generating' || c.state === 'queued')) {
+      return res.status(409).json({ error: 'Stop generation for this book before replacing it' });
+    }
+    await req.app.locals.generator.stopJob(job.id);
+    jobService.resetGeneration(job.id);
+    audioService.cleanupDir(path.join(config.uploadDir, 'audio', job.id));
+    audioService.cleanupDir(path.join(config.uploadDir, 'chunks', job.id));
+    jobService.updateJob(job.id, {
+      chapters_json: null, chapter_audios_json: null, transcript_json: null, error_message: null,
+      audio_url: null, audio_path: null, status: 'pending', stage: 'pending', progress: 0,
+    });
+    log.info('upload', `replace ${job.id}`);
+    res.json(describe(job));
+    analyzeJob(job.id).catch(err => log.error('upload', `analyzeJob failed for ${job.id}`, { err }));
+  } catch (err) { next(err); }
+});
+
+// POST /api/upload/:jobId/copy — new book entry from the same PDF; the old one stays as it is
+router.post('/:jobId/copy', async (req, res, next) => {
+  try {
+    const job = jobService.getJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    const jobId = uuidv4();
+    const sha256 = job.pdf_sha256 || await hashFile(job.pdf_path);
+    const pdfPath = path.join(path.dirname(job.pdf_path), `${jobId}.pdf`);
+    fs.copyFileSync(job.pdf_path, pdfPath);
+    let copy;
+    try {
+      // The hash moves to the newest copy so the next upload of this PDF finds it
+      copy = db.transaction(() => {
+        const holder = jobService.findJobByHash(sha256);
+        if (holder) jobService.updateJob(holder.id, { pdf_sha256: null });
+        return jobService.createJob({
+          id: jobId,
+          pdf_path: pdfPath,
+          pdf_filename: job.pdf_filename,
+          pdf_size_bytes: job.pdf_size_bytes,
+          page_count: job.page_count,
+          voice: job.voice,
+          speed: job.speed,
+          pdf_sha256: sha256,
+        });
+      })();
+    } catch (err) {
+      fs.rmSync(pdfPath, { force: true });
+      throw err;
+    }
+    log.info('upload', `copy ${job.id} -> ${jobId}`);
+    res.json(describe(copy));
+    analyzeJob(jobId).catch(err => log.error('upload', `analyzeJob failed for ${jobId}`, { err }));
+  } catch (err) { next(err); }
 });
 
 router.post('/', upload.single('file'), async (req, res, next) => {

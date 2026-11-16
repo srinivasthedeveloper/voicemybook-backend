@@ -34,7 +34,7 @@ function updateJob(id, fields) {
   const allowed = [
     'status', 'stage', 'progress', 'page_count', 'voice', 'speed',
     'chunks_total', 'chunks_done', 'audio_path', 'audio_url',
-    'chapters_json', 'chapter_audios_json', 'transcript_json', 'error_message',
+    'chapters_json', 'chapter_audios_json', 'transcript_json', 'error_message', 'pdf_sha256',
   ];
   const updates = Object.keys(fields).filter(k => allowed.includes(k));
   if (updates.length === 0) return;
@@ -47,9 +47,13 @@ function updateJob(id, fields) {
 }
 
 function deleteJob(id) {
+  resetGeneration(id);
+  db.prepare('DELETE FROM jobs WHERE id = ?').run(id);
+}
+
+function resetGeneration(id) {
   db.prepare('DELETE FROM chunks WHERE job_id = ?').run(id);
   db.prepare('DELETE FROM chapter_runs WHERE job_id = ?').run(id);
-  db.prepare('DELETE FROM jobs WHERE id = ?').run(id);
 }
 
 function getOldJobs(olderThanHours) {
@@ -121,6 +125,7 @@ module.exports = {
   getJob,
   updateJob,
   deleteJob,
+  resetGeneration,
   getOldJobs,
   registerSSEClient,
   unregisterSSEClient,

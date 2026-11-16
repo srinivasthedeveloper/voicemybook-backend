@@ -314,14 +314,15 @@ function getGenerator() {
     modelCached,
     slots: { kokoro: config.tts.workers, turbo: config.tts.turboWorkers, chatterbox: config.tts.cbWorkers },
     stitch: audioService.stitchFiles,
-    getChapters: jobId => {
+    // Cache PDF text only; chapters re-read so page ranges added later resolve
+    getChapters: async jobId => {
       if (!textCache.has(jobId)) {
-        const job = jobService.getJob(jobId);
-        textCache.set(jobId, pdfService.extractText(job.pdf_path)
-          .then(({ rawText }) => pdfService.splitChapterTexts(rawText, job.chapters || []).map(c => ({ title: c.title, text: c.text })))
+        textCache.set(jobId, pdfService.extractText(jobService.getJob(jobId).pdf_path)
+          .then(({ rawText }) => rawText)
           .catch(err => { textCache.delete(jobId); throw err; }));
       }
-      return textCache.get(jobId);
+      const rawText = await textCache.get(jobId);
+      return pdfService.splitChapterTexts(rawText, jobService.getJob(jobId).chapters || []).map(c => ({ title: c.title, text: c.text }));
     },
     emit: jobService.emitEvent,
     store,

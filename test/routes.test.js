@@ -252,3 +252,27 @@ test('book summaries: status per book, only for the ids asked', async () => {
   assert.deepStrictEqual(books[1], { id: running, filename: 'My Book.pdf', createdAt: books[1].createdAt, totalChapters: 2, readyChapters: 1, status: 'generating' });
   assert.deepStrictEqual(await (await fetch(`${base}/job/summary`)).json(), []);
 });
+
+test('copy moves the hash to the new job; replace resets audio state', async () => {
+  const id = seedJob();
+  const pdf = path.join(dir, 'book.pdf');
+  fs.writeFileSync(pdf, 'not really a pdf');
+  jobService.updateJob(id, { pdf_sha256: 'a'.repeat(64), chapter_audios_json: '{"0":"/x.mp3"}', error_message: 'old' });
+  require('../db').prepare('UPDATE jobs SET pdf_path = ? WHERE id = ?').run(pdf, id);
+
+  const copy = await (await post(`/upload/${id}/copy`)).json();
+  assert.notStrictEqual(copy.jobId, id);
+  assert.strictEqual(jobService.findJobByHash('a'.repeat(64)).id, copy.jobId);
+  assert.strictEqual(jobService.getJob(id).pdf_sha256, null);
+  assert.ok(fs.existsSync(jobService.getJob(copy.jobId).pdf_path));
+
+  store.setChapter(id, 0, { state: 'generating' });
+  assert.strictEqual((await post(`/upload/${id}/replace`)).status, 409);
+  store.setChapter(id, 0, { state: 'stopped' });
+  assert.strictEqual((await post(`/upload/${id}/replace`)).status, 200);
+  const job = jobService.getJob(id);
+  assert.strictEqual(store.listChapters(id).length, 0);
+  assert.strictEqual(job.chapter_audios_json, null);
+  assert.notStrictEqual(job.error_message, 'old');
+  assert.strictEqual((await post(`/job/${id}/range`, { startPage: 1, endPage: 1 })).status, 409);
+});
